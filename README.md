@@ -1,5 +1,5 @@
 # Taftan-thermal-anomaly-detection
-AI-driven detection of persistent thermal anomalies in the Taftan volcanic complex using Landsat 8 and Google Earth Engine.
+AI-driven detection of persistent thermal anomalies in the Taftan volcanic complex using Landsat 8
 
 **Author:** Peyman Namdarsehat  
 
@@ -53,7 +53,6 @@ The workflow is designed to be **automated, scalable, and robust**, consisting o
 - **Time period:** January 2023 – January 2024  
 - **Number of images:** 31  
 - **Spatial resolution:** 30 m  
-- **Platform:** Google Earth Engine  
 
 ---
 
