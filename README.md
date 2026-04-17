@@ -17,13 +17,7 @@ The approach integrates **remote sensing, cloud computing, and unsupervised mach
 
 ##  Geological Context
 
-The study area is located within the **Makran subduction zone**, at the convergent boundary between the Arabian and Eurasian plates. This region hosts one of the world’s largest accretionary prisms and is characterized by active magmatism driven by:
-
-- Slab dehydration  
-- Fluid migration  
-- Partial melting in the mantle wedge  
-
-These processes manifest at the surface as thermal anomalies within volcanic systems such as the **Taftan volcanic complex**.
+The study area is located within the **Makran subduction zone**. These processes manifest at the surface as thermal anomalies within volcanic systems such as the **Taftan volcanic complex**.
 
 ---
 
