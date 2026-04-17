@@ -1,0 +1,636 @@
+"""
+Author: Peyman Namdarsehat
+Date: 2026-04-17
+Project: AI-Driven Detection of Persistent Thermal Anomalies
+Study Area: Taftan Volcanic Complex, Makran Subduction Zone
+
+Description:
+This script implements a Google Earth Engine and Python-based workflow for detecting
+persistent thermal anomalies using Landsat 8 Collection 2 Level 2 data. The workflow
+includes:
+    1. ROI definition
+    2. QA-based cloud/shadow/snow masking
+    3. Land Surface Temperature (LST) retrieval
+    4. Valid-pixel filtering
+    5. Per-image unsupervised clustering
+    6. Hot-cluster extraction
+    7. Vote-map generation
+    8. Persistent Hot Zone (PHZ) delineation
+    9. PNG export and annotation
+
+Security Notice:
+Sensitive project/account information has been masked or moved to environment variables.
+Do not publish credentials, project IDs, tokens, private paths, or personal secrets
+in public repositories.
+"""
+
+# Optional dependency installation for Google Colab:
+# !pip install -q rasterio==1.3.10 geemap==0.32.0 earthengine-api==1.4.6 \
+#   fiona==1.9.6 geopandas==0.14.4 shapely==2.0.4 pyproj==3.6.1
+
+# ============================================================
+# Imports
+# ============================================================
+import os
+import io
+import time
+import urllib.request
+from datetime import datetime
+from typing import Tuple
+
+import ee
+import geemap
+import numpy as np
+import matplotlib.pyplot as plt
+
+from PIL import Image
+from google.colab import files
+from shapely import wkt as shapely_wkt
+from shapely.geometry import mapping as shapely_mapping
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.patches import Patch
+
+
+# ============================================================
+# Metadata
+# ============================================================
+AUTHOR = "Peyman Namdarsehat"
+DATE_CREATED = "2026-04-17"
+SCRIPT_VERSION = "1.0.0"
+
+print(f"Author: {AUTHOR}")
+print(f"Date: {DATE_CREATED}")
+print(f"Version: {SCRIPT_VERSION}")
+
+
+# ============================================================
+# Secure Setup & Initialization
+# ============================================================
+# Replace sensitive values with masked placeholders or environment variables.
+# Never expose real secrets in public repositories.
+
+EE_PROJECT_ID = os.getenv("EARTHENGINE_PROJECT", "***REDACTED***")
+
+if EE_PROJECT_ID == "***REDACTED***":
+    print("Warning: EARTHENGINE_PROJECT is not set. Please define it securely before running.")
+
+os.environ["EARTHENGINE_PROJECT"] = EE_PROJECT_ID
+os.environ["GOOGLE_CLOUD_PROJECT"] = EE_PROJECT_ID
+
+
+def initialize_earth_engine(project_id: str) -> None:
+    """Initialize Google Earth Engine safely."""
+    try:
+        ee.Initialize(project=project_id)
+        print("✓ Earth Engine initialized successfully.")
+    except Exception:
+        try:
+            geemap.ee_authenticate()
+        except Exception:
+            ee.Authenticate()
+        ee.Initialize(project=project_id)
+        print("✓ Earth Engine authenticated and initialized successfully.")
+
+
+initialize_earth_engine(EE_PROJECT_ID)
+
+
+# ============================================================
+# ROI INPUT CONFIGURATION
+# Choose one of: 'UPLOAD' | 'RECT' | 'WKT'
+# ============================================================
+ROI_MODE = "UPLOAD"
+
+RECT_BBOX = [58.0, 25.0, 62.0, 27.8]
+WKT_STRING = """POLYGON((61.2 26.0, 61.8 26.0, 61.8 26.6, 61.2 26.6, 61.2 26.0))"""
+
+
+def get_roi_from_mode(mode: str) -> ee.Geometry:
+    """Return ROI geometry based on selected input mode."""
+    mode = mode.upper().strip()
+
+    if mode == "UPLOAD":
+        print("Please upload your ROI file (zipped Shapefile, GeoJSON, KML, or KMZ).")
+        uploaded = files.upload()
+        local_path = list(uploaded.keys())[0]
+        fc = geemap.vector_to_ee(local_path)
+        geom = fc.geometry()
+        print("✓ ROI loaded from uploaded file.")
+        return geom
+
+    if mode == "RECT":
+        minx, miny, maxx, maxy = RECT_BBOX
+        geom = ee.Geometry.Rectangle(
+            [float(minx), float(miny), float(maxx), float(maxy)],
+            proj="EPSG:4326",
+            geodesic=False,
+        )
+        print("✓ ROI constructed from RECT.")
+        return geom
+
+    if mode == "WKT":
+        shape = shapely_wkt.loads(WKT_STRING)
+        geojson_like = shapely_mapping(shape)
+        geom = ee.Geometry(geojson_like, proj="EPSG:4326")
+        print("✓ ROI constructed from WKT.")
+        return geom
+
+    raise ValueError("Invalid ROI_MODE. Choose from {'UPLOAD', 'RECT', 'WKT'}.")
+
+
+roi = get_roi_from_mode(ROI_MODE)
+
+# Explicit bounded region for all outputs
+roi_bounds = roi.simplify(100).bounds(proj="EPSG:4326", maxError=1)
+region_coords = roi_bounds.getInfo()["coordinates"]
+region_geom = ee.Geometry.Polygon(region_coords[0])
+
+# Geographic extent for plotting
+xs = [p[0] for p in region_coords[0]]
+ys = [p[1] for p in region_coords[0]]
+minx, maxx = min(xs), max(xs)
+miny, maxy = min(ys), max(ys)
+extent = [minx, maxx, miny, maxy]
+
+
+# ============================================================
+# Time Window
+# ============================================================
+START_DATE = "2023-01-01"
+
+
+def one_year_after(date_str: str) -> str:
+    """Return the same date one year later."""
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    try:
+        d2 = d.replace(year=d.year + 1)
+    except ValueError:
+        d2 = d.replace(month=2, day=28, year=d.year + 1)
+    return d2.strftime("%Y-%m-%d")
+
+
+END_DATE = one_year_after(START_DATE)
+print(f"Time window: {START_DATE} → {END_DATE}")
+
+
+# ============================================================
+# Parameters
+# ============================================================
+EPSG = "EPSG:4326"
+SCALE_DEG = 30.0 / 111320.0
+PERCENTILE = 90
+MIN_VALID_PIXELS = 5000
+SAMPLE_PIXELS = 5000
+
+PALETTE_LST = ["#0000ff", "#00ffff", "#00ff00", "#ffff00", "#ff0000"]
+PALETTE_VOTES = ["#440154", "#31688e", "#35b779", "#fde725"]
+PALETTE_PHZ = ["#ff0000"]
+
+
+# ============================================================
+# Landsat 8 L2 Masking and LST Retrieval
+# QA_PIXEL bits: Cirrus=2, Cloud=3, Shadow=4, Snow/Ice=5
+# ============================================================
+def mask_l8l2(img: ee.Image) -> ee.Image:
+    """Mask clouds, cirrus, shadow, and snow/ice; then compute LST in °C."""
+    qa = img.select("QA_PIXEL")
+    good = (
+        qa.bitwiseAnd(1 << 2).eq(0)
+        .And(qa.bitwiseAnd(1 << 3).eq(0))
+        .And(qa.bitwiseAnd(1 << 4).eq(0))
+        .And(qa.bitwiseAnd(1 << 5).eq(0))
+    )
+
+    lst_c = (
+        img.select("ST_B10")
+        .multiply(0.00341802)
+        .add(149.0)
+        .subtract(273.15)
+        .rename("LST")
+    )
+
+    return lst_c.updateMask(good).copyProperties(img, ["system:time_start"])
+
+
+def add_valid_px(img: ee.Image) -> ee.Image:
+    """Add the number of valid pixels as image metadata."""
+    valid = img.reduceRegion(
+        ee.Reducer.count(),
+        roi,
+        30,
+        bestEffort=True,
+        tileScale=4
+    ).get("LST")
+    return img.set("valid_px", valid)
+
+
+l8 = (
+    ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+    .filterDate(START_DATE, END_DATE)
+    .filterBounds(roi)
+    .map(mask_l8l2)
+    .map(add_valid_px)
+    .filter(ee.Filter.greaterThan("valid_px", MIN_VALID_PIXELS))
+)
+
+print("Images passing valid-pixel filter:", l8.size().getInfo())
+
+median_lst = l8.median().rename("LST")
+
+
+# ============================================================
+# Visualization Bounds
+# ============================================================
+def get_vis_bounds(img: ee.Image, geom: ee.Geometry, p_low: int = 2, p_high: int = 98) -> Tuple[float, float]:
+    """Estimate robust min/max visualization bounds using percentiles."""
+    try:
+        d = img.reduceRegion(
+            ee.Reducer.percentile([p_low, p_high]),
+            geom,
+            30,
+            bestEffort=True,
+            tileScale=4,
+            maxPixels=1e9,
+        ).getInfo()
+
+        vmin = float(d.get(f"LST_p{p_low}", 0.0))
+        vmax = float(d.get(f"LST_p{p_high}", 60.0))
+        return vmin, vmax
+
+    except Exception:
+        img_coarse = img.reproject("EPSG:4326", None, 500)
+        d2 = img_coarse.reduceRegion(
+            ee.Reducer.percentile([p_low, p_high]),
+            geom,
+            500,
+            bestEffort=True,
+            tileScale=2,
+            maxPixels=1e9,
+        ).getInfo() or {}
+
+        vmin = float(d2.get(f"LST_p{p_low}", 0.0))
+        vmax = float(d2.get(f"LST_p{p_high}", 60.0))
+        return vmin, vmax
+
+
+vis_min, vis_max = get_vis_bounds(median_lst, roi)
+
+
+# ============================================================
+# Per-image Clustering: KMeans(k=5) → Top-2 Hot Clusters
+# ============================================================
+def km_hot_2(img: ee.Image) -> ee.Image:
+    """Extract hot pixels using top-2 hottest KMeans clusters for each image."""
+    lst = img.select("LST")
+
+    training = lst.sample(
+        region=roi,
+        scale=30,
+        numPixels=SAMPLE_PIXELS,
+        seed=1,
+        tileScale=4
+    )
+
+    def compute_hot():
+        clusterer = ee.Clusterer.wekaKMeans(5).train(training, ["LST"])
+        clusters = lst.cluster(clusterer).rename("km")
+
+        ids = ee.List.sequence(0, 4)
+
+        def id_to_feature(k):
+            k = ee.Number(k)
+            mean_dict = lst.updateMask(clusters.eq(k)).reduceRegion(
+                ee.Reducer.mean(),
+                roi,
+                30,
+                bestEffort=True,
+                tileScale=4,
+                maxPixels=1e9,
+            )
+            return ee.Feature(None, {"cluster": k, "mean": mean_dict.get("LST")})
+
+        stats = ee.FeatureCollection(ids.map(id_to_feature)).filter(
+            ee.Filter.notNull(["mean"])
+        )
+
+        top2 = ee.List(stats.sort("mean", False).limit(2).aggregate_array("cluster"))
+        c1 = ee.Number(top2.get(0))
+        c2 = ee.Number(top2.get(1))
+
+        hot = ee.Image(0).rename("hot")
+        hot = hot.where(clusters.eq(c1).Or(clusters.eq(c2)), 1)
+
+        return hot.updateMask(hot).unmask(0)
+
+    hot = ee.Image(
+        ee.Algorithms.If(
+            ee.Number(training.size()).gt(10),
+            compute_hot(),
+            ee.Image(0).rename("hot"),
+        )
+    )
+
+    return hot.copyProperties(img, ["system:time_start"])
+
+
+hot_col = l8.map(km_hot_2)
+votes = hot_col.sum().rename("votes").toInt16()
+
+
+# ============================================================
+# Robust Percentile Thresholding
+# ============================================================
+def robust_percentile_threshold(img: ee.Image, geom: ee.Geometry, p: int) -> ee.Number:
+    """Return robust percentile threshold with fallback behavior."""
+    try:
+        red = img.reduceRegion(
+            ee.Reducer.percentile([p]),
+            geom,
+            30,
+            bestEffort=True,
+            tileScale=4,
+            maxPixels=1e9,
+        )
+    except Exception:
+        red = img.reproject("EPSG:4326", None, 250).reduceRegion(
+            ee.Reducer.percentile([p]),
+            geom,
+            250,
+            bestEffort=True,
+            tileScale=2,
+            maxPixels=1e9,
+        )
+
+    d = ee.Dictionary(red)
+    has_vals = d.size().gt(0)
+
+    max_dict = img.reduceRegion(
+        ee.Reducer.max(),
+        geom,
+        30,
+        bestEffort=True,
+        tileScale=4,
+        maxPixels=1e9,
+    )
+
+    band = ee.String(img.bandNames().get(0))
+    vmax = ee.Number(ee.Dictionary(max_dict).get(band, 0))
+
+    return ee.Number(
+        ee.Algorithms.If(
+            has_vals,
+            ee.Number(ee.List(d.values()).get(0)),
+            ee.Algorithms.If(vmax.gt(0), vmax.multiply(0.9), 1),
+        )
+    )
+
+
+p_thresh = robust_percentile_threshold(votes, roi, PERCENTILE)
+phz = votes.gte(p_thresh).selfMask().rename("PHZ")
+
+
+# ============================================================
+# Export Helpers
+# ============================================================
+def save_png_from_image(
+    image_rgb: ee.Image,
+    out_png: str,
+    region_coords,
+    region_geom,
+    dims_try=(1400, 1200, 1024, 800),
+) -> bool:
+    """Save PNG with fallback from geemap thumbnail to direct EE URL."""
+    for dims in dims_try:
+        try:
+            geemap.get_image_thumbnail(
+                image_rgb,
+                out_png,
+                region=region_coords,
+                vis_params={},
+                dimensions=dims,
+                format="png",
+            )
+            if os.path.exists(out_png):
+                print(f"✓ Saved PNG ({dims}px): {out_png}")
+                return True
+        except Exception as e:
+            print(f"⚠ geemap thumbnail failed at {dims}px: {e}")
+
+        try:
+            url = image_rgb.getThumbURL(
+                {
+                    "region": region_geom,
+                    "dimensions": dims,
+                    "format": "png",
+                }
+            )
+            urllib.request.urlretrieve(url, out_png)
+            if os.path.exists(out_png):
+                print(f"✓ Saved PNG via URL ({dims}px): {out_png}")
+                return True
+        except Exception as e:
+            print(f"⚠ EE URL thumbnail failed at {dims}px: {e}")
+
+    print(f"✗ Could not save PNG: {out_png}")
+    return False
+
+
+def cmap_from_palette(palette_hex, name="custom"):
+    """Convert hex color list to matplotlib colormap."""
+    return LinearSegmentedColormap.from_list(name, palette_hex)
+
+
+def annotate_with_colorbar(
+    png_in: str,
+    png_out: str,
+    extent,
+    title: str = None,
+    cmap=None,
+    norm=None,
+    cbar_label: str = None,
+    legend_patch=None,
+) -> None:
+    """Annotate PNG with geographic axes, colorbar, and optional legend."""
+    im = Image.open(png_in).convert("RGBA")
+    arr = np.array(im)
+
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=170)
+    ax.imshow(arr, extent=extent, origin="upper")
+    ax.set_xlabel("Longitude (°)")
+    ax.set_ylabel("Latitude (°)")
+
+    if title:
+        ax.set_title(title)
+
+    ax.grid(True, which="both", linestyle="--", linewidth=0.3, alpha=0.7)
+
+    if (cmap is not None) and (norm is not None):
+        mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        mappable.set_array([])
+
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="3.5%", pad=0.15)
+        cbar = plt.colorbar(mappable, cax=cax)
+
+        if cbar_label:
+            cbar.set_label(cbar_label)
+
+    if legend_patch is not None:
+        ax.legend(handles=[legend_patch], loc="lower right", frameon=True)
+
+    plt.tight_layout()
+    fig.savefig(png_out, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+# ============================================================
+# Visualization and PNG Export
+# ============================================================
+median_vis = median_lst.visualize(min=vis_min, max=vis_max, palette=PALETTE_LST)
+median_png = "median_lst_1yr_L8.png"
+ok_m = save_png_from_image(median_vis, median_png, region_coords, region_geom)
+
+try:
+    votes_max_info = votes.reduceRegion(
+        ee.Reducer.max(),
+        roi,
+        30,
+        bestEffort=True,
+        tileScale=4,
+        maxPixels=1e9,
+    ).getInfo()
+    votes_max = float(list(votes_max_info.values())[0]) if votes_max_info else 1.0
+except Exception:
+    votes_max_info = votes.reproject("EPSG:4326", None, 250).reduceRegion(
+        ee.Reducer.max(),
+        roi,
+        250,
+        bestEffort=True,
+        tileScale=2,
+        maxPixels=1e9,
+    ).getInfo()
+    votes_max = float(list(votes_max_info.values())[0]) if votes_max_info else 1.0
+
+votes_vis = votes.visualize(min=0, max=max(1.0, votes_max), palette=PALETTE_VOTES)
+votes_png = "votes_1yr_L8.png"
+ok_v = save_png_from_image(votes_vis, votes_png, region_coords, region_geom)
+
+phz_vis = phz.visualize(palette=PALETTE_PHZ, opacity=0.6)
+overlay = median_vis.blend(phz_vis)
+phz_png = f"phz_p{PERCENTILE}_1yr_L8.png"
+ok_p = save_png_from_image(overlay, phz_png, region_coords, region_geom)
+
+
+# ============================================================
+# Colormaps and Legends
+# ============================================================
+cmap_lst = cmap_from_palette(PALETTE_LST, name="lst")
+norm_lst = Normalize(vmin=vis_min, vmax=vis_max)
+
+vmax_votes = max(1.0, votes_max)
+cmap_votes = cmap_from_palette(PALETTE_VOTES, name="votes")
+norm_votes = Normalize(vmin=0, vmax=vmax_votes)
+
+cmap_phz_base = cmap_lst
+norm_phz_base = norm_lst
+phz_patch = Patch(facecolor=PALETTE_PHZ[0], edgecolor="k", label="PHZ (mask)")
+
+
+# ============================================================
+# Annotated Exports and Downloads
+# ============================================================
+if ok_m:
+    median_png_annot = "median_lst_1yr_L8_annot.png"
+    annotate_with_colorbar(
+        png_in=median_png,
+        png_out=median_png_annot,
+        extent=extent,
+        title=f"Median LST (°C) — {START_DATE} to {END_DATE}",
+        cmap=cmap_lst,
+        norm=norm_lst,
+        cbar_label="LST (°C)",
+    )
+    try:
+        files.download(median_png_annot)
+        files.download(median_png)
+    except Exception:
+        pass
+
+if ok_v:
+    votes_png_annot = "votes_1yr_L8_annot.png"
+    annotate_with_colorbar(
+        png_in=votes_png,
+        png_out=votes_png_annot,
+        extent=extent,
+        title="Hot-Cluster Votes (count)",
+        cmap=cmap_votes,
+        norm=norm_votes,
+        cbar_label="Vote count",
+    )
+    try:
+        files.download(votes_png_annot)
+        files.download(votes_png)
+    except Exception:
+        pass
+
+if ok_p:
+    phz_png_annot = f"phz_p{PERCENTILE}_1yr_L8_annot.png"
+    annotate_with_colorbar(
+        png_in=phz_png,
+        png_out=phz_png_annot,
+        extent=extent,
+        title=f"Persistently Hot Zones (≥ P{PERCENTILE})",
+        cmap=cmap_phz_base,
+        norm=norm_phz_base,
+        cbar_label="LST (°C)",
+        legend_patch=phz_patch,
+    )
+    try:
+        files.download(phz_png_annot)
+        files.download(phz_png)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Optional GeoTIFF Export
+# Uncomment if needed
+# ============================================================
+# geemap.ee_export_image(
+#     median_lst.clip(roi),
+#     "median_lst_1yr_L8_epsg4326_30m.tif",
+#     scale=SCALE_DEG,
+#     region=region_coords,
+#     crs="EPSG:4326",
+#     file_per_band=False,
+# )
+#
+# geemap.ee_export_image(
+#     votes.clip(roi),
+#     "lst_hot_votes_1yr_L8_epsg4326_30m.tif",
+#     scale=SCALE_DEG,
+#     region=region_coords,
+#     crs="EPSG:4326",
+#     file_per_band=False,
+# )
+#
+# geemap.ee_export_image(
+#     phz.clip(roi),
+#     f"phz_p{PERCENTILE}_1yr_L8_epsg4326_30m.tif",
+#     scale=SCALE_DEG,
+#     region=region_coords,
+#     crs="EPSG:4326",
+#     file_per_band=False,
+# )
+
+
+# ============================================================
+# Final Summary
+# ============================================================
+print(
+    "Done.",
+    "Images used:", l8.size().getInfo(),
+    "Percentile:", PERCENTILE,
+    "LST vis range:", (vis_min, vis_max),
+)
