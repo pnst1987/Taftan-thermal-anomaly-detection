@@ -80,15 +80,6 @@ Highlights spatially coherent and stable thermal anomalies.
 
 ---
 
-##  Scientific Contributions
-
-- Integration of **AI (unsupervised clustering)** with satellite-derived thermal data  
-- Development of a **robust PHZ detection framework**  
-- Fully **reproducible and scalable workflow** using GEE  
-- Cost-effective alternative to traditional geothermal exploration  
-
----
-
 ##  Applications
 
 - Volcanic monitoring  
